@@ -298,10 +298,23 @@ tabulate, as functions of affine parameter and step size:
   right-hand side is *identically zero*, so **any** Runge–Kutta method
   conserves $E$ to floating point. Zero drift here is a bug detector for
   the RHS and indexing, not evidence about integrator quality;
-- drift in the angular momentum $L = x\,p_y - y\,p_x$ for a **single hole
-  at the origin** — a quadratic invariant, conserved exactly by implicit
-  midpoint (Gauss method) and not by RK4. This is the sharp side-by-side;
-- RK4 vs. ImplicitMidpoint on all of the above.
+- conservation of the angular momentum $L = x\,p_y - y\,p_x$ for a
+  **single hole at the origin** — the Noether charge of the rotational
+  symmetry. Both integrators conserve it well on a regular fly-by
+  (Phase-3 measurement: $|\Delta L| \lesssim 10^{-12}$), so this validates
+  the *physics* (the metric is genuinely rotationally symmetric), not
+  integrator quality;
+- RK4 vs. ImplicitMidpoint on all of the above — **with the caveat, measured
+  in Phase 3, that a single null geodesic here is too short an affine arc to
+  show the symplectic advantage.** These geodesics escape or are captured;
+  there is no long-time confinement, so RK4's 4th order typically *beats*
+  midpoint's 2nd-order structure-preservation on both $H$ and $L$ for a
+  fly-by. The clean symplectic-vs-RK4 contrast lives where it is real — the
+  bound harmonic oscillator (Phase 1), where RK4 drifts secularly and
+  midpoint holds the quadratic invariant to round-off. We keep both
+  integrators (the interface is agnostic, and long-lived orbits or a future
+  bound system will want the symplectic one), but we do not oversell the
+  contrast on MP fly-bys.
 
 **Exact-answer checks (single hole, mass $m$, at the origin):**
 
