@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { minkowski, majumdarPapapetrou, Event } from "../src/spacetime/index.ts";
-import { lightCone, uniformDirections } from "../src/lightcone/index.ts";
+import { lightCone, uniformDirections, absorbedNear } from "../src/lightcone/index.ts";
 
 test("apex row is exactly the event for every ray", () => {
   const cone = lightCone(minkowski(), Event.of(0, 2, -1), {
@@ -58,6 +58,28 @@ test("Majumdar–Papapetrou wavefront is closed but lensed (not a circle)", () =
     rMax = Math.max(rMax, r);
   }
   assert.ok(rMax - rMin > 0.05, `wavefront is lensed, not circular (spread ${rMax - rMin})`);
+});
+
+test("a termination predicate absorbs rays at the throat, leaving no NaNs", () => {
+  const holes = [{ x: 0, y: 0 }];
+  const M = majumdarPapapetrou([{ mass: 1, x: 0, y: 0 }]);
+  const cone = lightCone(M, Event.of(0, 4, 0), {
+    directions: uniformDirections(120),
+    samples: 100,
+    step: 0.15,
+    maxRadius: 40,
+    terminate: absorbedNear(holes, 0.3),
+  });
+  // rays toward the hole are absorbed, rays away escape — either way some end
+  // before the full sample count, and the adaptive tracer leaves no garbage.
+  let terminated = 0;
+  for (let i = 0; i < cone.rayCount; i += 1) {
+    if (cone.rayLengths[i]! < cone.sampleCount) terminated += 1;
+  }
+  assert.ok(terminated > 0, "some rays terminated (absorbed or escaped)");
+  for (let k = 0; k < cone.positions.length; k += 1) {
+    assert.ok(Number.isFinite(cone.positions[k]!), "no NaN/Inf in the grid");
+  }
 });
 
 test("rays that leave maxRadius terminate early (shorter rayLength)", () => {

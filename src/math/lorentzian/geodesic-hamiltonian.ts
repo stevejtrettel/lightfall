@@ -69,6 +69,28 @@ export function geodesicHamiltonian<V extends SpaceView>(
   });
 }
 
+// The geodesic flow bundled as a first-class Hamiltonian system: the phase
+// space, the Hamiltonian H (the null-defect monitor), and the flow field
+// together. Generic and adaptive integrators consume `.field`; a future
+// symplectic `HamiltonianMethod` consumes the whole system (it is the seam
+// symplectic integration slots into — see plan §3 discussion). Bundling what
+// we already build separately, so the structure isn't thrown away.
+export interface HamiltonianSystem<V extends SpaceView> {
+  readonly phase: Space<PhaseView<V>>;
+  readonly H: ScalarField<PhaseView<V>>;
+  readonly field: VectorField<PhaseView<V>>;
+}
+
+export function geodesicSystem<V extends SpaceView>(
+  M: LorentzianManifold<V>,
+): HamiltonianSystem<V> {
+  return {
+    phase: phaseSpace(M),
+    H: hamiltonian(M),
+    field: geodesicHamiltonian(M),
+  };
+}
+
 // H(x, p) = ½ g^{μν}(x) p_μ p_ν as a scalar field on T*M. Its value is the
 // null defect: 0 on null geodesics, and its drift along an integrated
 // trajectory is the coordinate-invariant error meter of plan §3.2.

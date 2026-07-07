@@ -1,78 +1,100 @@
 import type { SpaceView } from "../../spaces/index.ts";
 import type { VectorField } from "../../maps/index.ts";
-import { VectorFieldStepper } from "./vector-field-stepper.ts";
+import { FixedStepSolver, type Method, type Solver } from "./solver.ts";
 
 export interface ImplicitMidpointOptions {
-  // Fixed-point convergence tolerance (max component change between
-  // iterations). Default 1e-12.
+  step: number;
+  // Fixed-point (Picard) tolerance and iteration cap for the implicit solve.
   tol?: number;
-  // Maximum fixed-point iterations per step before giving up. Default 100.
   maxIterations?: number;
 }
 
-// The implicit midpoint rule:
-//
-//   y_{n+1} = y_n + h · v( (y_n + y_{n+1}) / 2 ).
-//
-// A second-order Gauss method: symplectic on a Hamiltonian vector field, and
-// as a Gauss collocation method it conserves *quadratic* invariants exactly.
-// That is the sharp side of the RK4 comparison (plan §7): on the geodesic
-// flow it holds the null condition H bounded and conserves angular-momentum-
-// type charges to floating point, where RK4 drifts.
-//
-// The step is implicit; we solve for y_{n+1} by fixed-point (Picard)
-// iteration, which contracts at the step sizes these flows use. `tol` and
-// `maxIterations` are explicit parameters of the scheme, not hidden constants.
-// (A Newton inner solve — needing the flow's Jacobian — is the upgrade path
-// for stiff regimes; see plan §11.) Working buffers are allocated once.
-export class ImplicitMidpoint<V extends SpaceView> extends VectorFieldStepper<V> {
+// The implicit midpoint rule, y_{n+1} = y_n + h·v((y_n + y_{n+1})/2), as a
+// fixed-step Method. A second-order Gauss method: symplectic when the field is
+// a canonical Hamiltonian flow (the caller's contract — see geodesicSystem),
+// and it conserves quadratic invariants exactly. This is the first member of
+// the "Hamiltonian" family; it happens to consume only a VectorField because
+// the symplecticity is a property of that field, not something the scheme
+// enforces. The implicit step is solved by Picard iteration.
+export class ImplicitMidpoint<S extends SpaceView> implements Method<S> {
+  private readonly field: VectorField<S>;
+  private readonly step: number;
   private readonly tol: number;
   private readonly maxIterations: number;
-  private readonly next: V; // current guess for y_{n+1}
-  private readonly mid: V; // the midpoint (y_n + next) / 2
-  private readonly k: V; // v(mid)
 
-  constructor(vf: VectorField<V>, options: ImplicitMidpointOptions = {}) {
-    super(vf);
+  constructor(field: VectorField<S>, options: ImplicitMidpointOptions) {
+    this.field = field;
+    this.step = options.step;
     this.tol = options.tol ?? 1e-12;
     this.maxIterations = options.maxIterations ?? 100;
+  }
+
+  solver(y0: S, lambda0 = 0): Solver<S> {
+    return new ImplicitMidpointSolver(
+      this.field,
+      y0,
+      lambda0,
+      this.step,
+      this.tol,
+      this.maxIterations,
+    );
+  }
+}
+
+class ImplicitMidpointSolver<S extends SpaceView> extends FixedStepSolver<S> {
+  private readonly vf: VectorField<S>;
+  private readonly tol: number;
+  private readonly maxIterations: number;
+  private readonly next: S;
+  private readonly mid: S;
+  private readonly k: S;
+
+  constructor(
+    field: VectorField<S>,
+    y0: S,
+    lambda0: number,
+    step: number,
+    tol: number,
+    maxIterations: number,
+  ) {
+    super(field, y0, lambda0, step);
+    this.vf = field;
+    this.tol = tol;
+    this.maxIterations = maxIterations;
     this.next = this.vs.create();
     this.mid = this.vs.create();
     this.k = this.vs.create();
   }
 
-  step(state: V, dt: number): V {
+  protected stepOnce(dt: number): void {
     const { vs, vf } = this;
-    const n = state.dimension;
-    const yBuf = state.buffer;
-    const yOff = state.offset;
-    const nextBuf = this.next.buffer; // created buffers: offset 0
+    const s = this.state;
+    const n = s.dimension;
+    const sBuf = s.buffer;
+    const sOff = s.offset;
+    const nextBuf = this.next.buffer;
+    const nextOff = this.next.offset;
     const kBuf = this.k.buffer;
+    const kOff = this.k.offset;
 
-    // Initial guess y_{n+1} = y_n (explicit-Euler seed).
-    vs.copy(this.next, state);
+    vs.copy(this.next, s); // seed y_{n+1} = y_n
 
     for (let iter = 0; iter < this.maxIterations; iter += 1) {
-      // mid = (y_n + next) / 2
-      vs.copy(this.mid, state);
+      vs.copy(this.mid, s);
       vs.addScaled(this.mid, 1, this.next);
       vs.scale(this.mid, 0.5);
-
       vf.evaluateInto(this.k, this.mid);
 
-      // next ← y_n + h·k, tracking the largest component change to test
-      // convergence in the same sweep.
       let change = 0;
       for (let i = 0; i < n; i += 1) {
-        const updated = yBuf[yOff + i]! + dt * kBuf[i]!;
-        const delta = Math.abs(updated - nextBuf[i]!);
+        const updated = sBuf[sOff + i]! + dt * kBuf[kOff + i]!;
+        const delta = Math.abs(updated - nextBuf[nextOff + i]!);
         if (delta > change) change = delta;
-        nextBuf[i] = updated;
+        nextBuf[nextOff + i] = updated;
       }
       if (change <= this.tol) break;
     }
 
-    vs.copy(state, this.next);
-    return state;
+    vs.copy(s, this.next);
   }
 }

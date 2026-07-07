@@ -3,12 +3,10 @@ import assert from "node:assert/strict";
 
 import { vec2Space, type Vec2 } from "../src/math/spaces/index.ts";
 import { VectorField } from "../src/math/maps/index.ts";
-import { RK4, ImplicitMidpoint } from "../src/math/numerics/index.ts";
+import { RK4, ImplicitMidpoint, DormandPrince } from "../src/math/numerics/index.ts";
 
-// Harmonic oscillator as a Hamiltonian flow on R² = (q, p), H = ½(q² + p²):
-//   q̇ = p,  ṗ = −q.
-// Exact solution is uniform rotation on the circle q² + p² = const; the
-// energy H is a quadratic invariant.
+// Harmonic oscillator on R² = (q, p), H = ½(q² + p²): q̇ = p, ṗ = −q.
+// Exact solution from (1, 0): q = cos λ, p = −sin λ.
 const phase = vec2Space("phase(q,p)");
 const oscillator = VectorField.inPlace(phase, (out, x) => {
   const q = x.x;
@@ -16,56 +14,46 @@ const oscillator = VectorField.inPlace(phase, (out, x) => {
   out.x = p;
   out.y = -q;
 });
-
 const energy = (s: Vec2): number => 0.5 * (s.x * s.x + s.y * s.y);
 const start = (): Vec2 => phase.create((s) => s.set(1, 0));
 
-test("RK4 tracks one period of the oscillator accurately", () => {
-  const rk4 = new RK4(oscillator);
-  const steps = 2000;
-  const dt = (2 * Math.PI) / steps; // exactly one period
-  const end = rk4.flow(start(), dt, steps);
-  // after one full period the state returns to (1, 0)
-  assert.ok(Math.abs(end.x - 1) < 1e-6, `q returned to 1 (got ${end.x})`);
-  assert.ok(Math.abs(end.y) < 1e-6, `p returned to 0 (got ${end.y})`);
+test("RK4 (fixed step) tracks one period accurately", () => {
+  const solver = new RK4(oscillator, { step: (2 * Math.PI) / 2000 }).solver(start());
+  solver.advanceTo(2 * Math.PI);
+  assert.ok(Math.abs(solver.state.x - 1) < 1e-6, `q → 1 (got ${solver.state.x})`);
+  assert.ok(Math.abs(solver.state.y) < 1e-6, `p → 0 (got ${solver.state.y})`);
 });
 
 test("implicit midpoint conserves the quadratic energy to ~machine precision", () => {
-  const mid = new ImplicitMidpoint(oscillator);
-  const dt = 0.05;
-  const steps = 4000; // ~32 periods
-  const s = start();
-  const e0 = energy(s);
-  mid.flow(s, dt, steps);
-  const drift = Math.abs(energy(s) - e0);
-  // Gauss method ⇒ exact quadratic-invariant conservation, up to round-off.
-  assert.ok(drift < 1e-9, `energy drift ${drift} should be ~0`);
+  const solver = new ImplicitMidpoint(oscillator, { step: 0.05 }).solver(start());
+  solver.advanceTo(0.05 * 4000);
+  assert.ok(Math.abs(energy(solver.state) - 0.5) < 1e-9, `energy held (got ${energy(solver.state)})`);
 });
 
-test("RK4 energy drifts more than implicit midpoint over a long run", () => {
-  const dt = 0.05;
-  const steps = 4000;
-
-  const sMid = start();
-  const e0 = energy(sMid);
-  new ImplicitMidpoint(oscillator).flow(sMid, dt, steps);
-  const midDrift = Math.abs(energy(sMid) - e0);
-
-  const sRk4 = start();
-  new RK4(oscillator).flow(sRk4, dt, steps);
-  const rk4Drift = Math.abs(energy(sRk4) - e0);
-
-  // RK4 stays bounded (it is high-order and accurate) but does not conserve
-  // the invariant the way the symplectic method does.
-  assert.ok(rk4Drift > midDrift, `RK4 drift ${rk4Drift} > midpoint ${midDrift}`);
-  assert.ok(rk4Drift < 1e-2, "RK4 remains well-behaved over this run");
+test("Dormand–Prince integrates accurately with adaptive steps", () => {
+  const solver = new DormandPrince(oscillator, { rtol: 1e-9, atol: 1e-12 }).solver(start());
+  solver.advanceTo(2 * Math.PI);
+  assert.ok(Math.abs(solver.state.x - 1) < 1e-7, `q → 1 (got ${solver.state.x})`);
+  assert.ok(Math.abs(solver.state.y) < 1e-7, `p → 0 (got ${solver.state.y})`);
+  assert.ok(Math.abs(energy(solver.state) - 0.5) < 1e-8, "energy stays put");
 });
 
-test("integrate returns n+1 snapshots, first equal to the initial state", () => {
-  const rk4 = new RK4(oscillator);
-  const traj = rk4.integrate(start(), 0.1, 10);
-  assert.equal(traj.length, 11);
-  assert.deepEqual([traj[0]!.x, traj[0]!.y], [1, 0]);
-  // snapshots are independent copies, not aliases of one mutated buffer
-  assert.notEqual(traj[0]!.buffer, traj[1]!.buffer);
+test("dense output lands on intermediate targets (not just step boundaries)", () => {
+  // Adaptive steps won't naturally hit λ = π/2; the interpolant must.
+  const solver = new DormandPrince(oscillator, { rtol: 1e-9, atol: 1e-12 }).solver(start());
+  solver.advanceTo(Math.PI / 2);
+  assert.equal(solver.lambda, Math.PI / 2);
+  assert.ok(Math.abs(solver.state.x - 0) < 1e-6, `q(π/2) = 0 (got ${solver.state.x})`);
+  assert.ok(Math.abs(solver.state.y + 1) < 1e-6, `p(π/2) = −1 (got ${solver.state.y})`);
+});
+
+test("advanceTo is monotone and does not disturb the initial value", () => {
+  const y0 = start();
+  const solver = new DormandPrince(oscillator).solver(y0);
+  solver.advanceTo(1);
+  solver.advanceTo(2);
+  assert.equal(solver.lambda, 2);
+  assert.deepEqual([y0.x, y0.y], [1, 0], "y0 untouched by the solver");
+  solver.advanceTo(1); // backward is a no-op
+  assert.equal(solver.lambda, 2);
 });

@@ -1,30 +1,40 @@
 import type { SpaceView } from "../../spaces/index.ts";
 import type { VectorField } from "../../maps/index.ts";
-import { VectorFieldStepper } from "./vector-field-stepper.ts";
+import { FixedStepSolver, type Method, type Solver } from "./solver.ts";
 
-// Classical 4-stage Runge–Kutta.
-//
-//   k1 = v(y)
-//   k2 = v(y + h/2·k1)
-//   k3 = v(y + h/2·k2)
-//   k4 = v(y + h·k3)
-//   y ← y + h/6·(k1 + 2k2 + 2k3 + k4)
-//
-// Fourth-order, explicit, non-symplectic — the workhorse for smooth,
-// non-stiff flows. On a Hamiltonian system it is accurate per step but its
-// invariants (energy, quadratic charges) drift secularly over long
-// integrations; that is the contrast implicit midpoint exists to show
-// (plan §7). Stage buffers are allocated once and reused: `step` allocates
-// nothing.
-export class RK4<V extends SpaceView> extends VectorFieldStepper<V> {
-  private readonly k1: V;
-  private readonly k2: V;
-  private readonly k3: V;
-  private readonly k4: V;
-  private readonly scratch: V;
+export interface RK4Options {
+  // Fixed sub-step size (affine parameter). advanceTo subdivides to land on
+  // targets exactly, so this is the target sub-step, not a hard grid.
+  step: number;
+}
 
-  constructor(vf: VectorField<V>) {
-    super(vf);
+// Classical 4-stage Runge–Kutta as a fixed-step Method. Fourth-order,
+// explicit, non-symplectic — the cheap workhorse and the validation anchor.
+export class RK4<S extends SpaceView> implements Method<S> {
+  private readonly field: VectorField<S>;
+  private readonly step: number;
+
+  constructor(field: VectorField<S>, options: RK4Options) {
+    this.field = field;
+    this.step = options.step;
+  }
+
+  solver(y0: S, lambda0 = 0): Solver<S> {
+    return new RK4Solver(this.field, y0, lambda0, this.step);
+  }
+}
+
+class RK4Solver<S extends SpaceView> extends FixedStepSolver<S> {
+  private readonly vf: VectorField<S>;
+  private readonly k1: S;
+  private readonly k2: S;
+  private readonly k3: S;
+  private readonly k4: S;
+  private readonly scratch: S;
+
+  constructor(field: VectorField<S>, y0: S, lambda0: number, step: number) {
+    super(field, y0, lambda0, step);
+    this.vf = field;
     this.k1 = this.vs.create();
     this.k2 = this.vs.create();
     this.k3 = this.vs.create();
@@ -32,28 +42,25 @@ export class RK4<V extends SpaceView> extends VectorFieldStepper<V> {
     this.scratch = this.vs.create();
   }
 
-  step(state: V, dt: number): V {
+  protected stepOnce(dt: number): void {
     const { vs, vf } = this;
+    const s = this.state;
     const half = dt / 2;
 
-    vf.evaluateInto(this.k1, state);
-
-    vs.copy(this.scratch, state);
+    vf.evaluateInto(this.k1, s);
+    vs.copy(this.scratch, s);
     vs.addScaled(this.scratch, half, this.k1);
     vf.evaluateInto(this.k2, this.scratch);
-
-    vs.copy(this.scratch, state);
+    vs.copy(this.scratch, s);
     vs.addScaled(this.scratch, half, this.k2);
     vf.evaluateInto(this.k3, this.scratch);
-
-    vs.copy(this.scratch, state);
+    vs.copy(this.scratch, s);
     vs.addScaled(this.scratch, dt, this.k3);
     vf.evaluateInto(this.k4, this.scratch);
 
-    vs.addScaled(state, dt / 6, this.k1);
-    vs.addScaled(state, dt / 3, this.k2);
-    vs.addScaled(state, dt / 3, this.k3);
-    vs.addScaled(state, dt / 6, this.k4);
-    return state;
+    vs.addScaled(s, dt / 6, this.k1);
+    vs.addScaled(s, dt / 3, this.k2);
+    vs.addScaled(s, dt / 3, this.k3);
+    vs.addScaled(s, dt / 6, this.k4);
   }
 }

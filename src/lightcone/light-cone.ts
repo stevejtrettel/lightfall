@@ -1,47 +1,67 @@
 import {
-  geodesicHamiltonian,
+  geodesicSystem,
   nullConeAt,
-  phaseSpace,
   type LorentzianManifold,
   type PhaseView,
 } from "../math/lorentzian/index.ts";
-import { RK4, type Integrator } from "../math/numerics/index.ts";
+import { DormandPrince, type Method } from "../math/numerics/index.ts";
 import type { VectorField } from "../math/maps/index.ts";
 import { Event } from "../spacetime/index.ts";
+
+// A ray stops when this returns true: absorbed at a hole, escaped, whatever the
+// spacetime deems terminal. Built from the spacetime's structure (it knows its
+// holes) but passed into `lightCone`, so the cone stays spacetime-agnostic.
+export type Terminator = (state: PhaseView<Event>) => boolean;
+
+// A ray reaching within `radius` of any center is absorbed (the black-hole
+// throats). Compose with the hole positions the caller already has.
+export function absorbedNear(
+  centers: readonly { x: number; y: number }[],
+  radius: number,
+): Terminator {
+  const r2 = radius * radius;
+  return (s) => {
+    for (const c of centers) {
+      const dx = s.pos.x - c.x;
+      const dy = s.pos.y - c.y;
+      if (dx * dx + dy * dy < r2) return true;
+    }
+    return false;
+  };
+}
 
 export interface LightConeOptions {
   // Emission angles (radians). Build with a sampler from `samplers.ts`.
   directions: readonly number[];
   // Number of recorded samples per ray, including the apex (≥ 2).
   samples: number;
-  // Affine-parameter spacing between recorded samples (Δλ).
+  // Affine-parameter spacing between recorded samples (the sampling
+  // resolution; the integrator chooses its own internal steps).
   step: number;
-  // Integrator sub-steps per recorded sample (dt = step / substeps). Default 1.
-  substeps?: number;
   // Null normalization E = −p_t. Default 1.
   energy?: number;
-  // Integrator factory. Default RK4. Pass e.g. `(f) => new ImplicitMidpoint(f)`
-  // to trace with a different scheme (the adaptive scheme will slot in here).
-  integrator?: (flow: VectorField<PhaseView<Event>>) => Integrator<PhaseView<Event>>;
-  // Stop a ray once its spatial radius exceeds this, or its state goes
-  // non-finite (a ray plunging into a hole). Default Infinity.
+  // Integrator factory. Default adaptive Dormand–Prince. Pass e.g.
+  // `(f) => new RK4(f, { step: 0.02 })` to trace with a fixed-step scheme.
+  method?: (flow: VectorField<PhaseView<Event>>) => Method<PhaseView<Event>>;
+  // Physics termination (e.g. absorption at a hole).
+  terminate?: Terminator;
+  // Escape guard: stop a ray once its spatial radius exceeds this. Default ∞.
   maxRadius?: number;
 }
 
 // A computed light cone: the future null-geodesic congruence from one event,
 // traced once and stored as a rectangular grid `positions[ray][sample]` of
-// spacetime points (t, x, y). Every visualization — the swept surface, the
-// rays, the constant-time wavefront, the spatial shadow — is a *view* of this
-// one grid (plan §4.1), not a re-integration.
+// spacetime points (t, x, y). Every view — surface, rays, wavefront, shadow —
+// reads this one grid (plan §4.1).
 export class LightCone {
   readonly manifold: LorentzianManifold<Event>;
   readonly apexT: number;
   readonly apexX: number;
   readonly apexY: number;
-  readonly directions: Float64Array; // [ray] emission angle
-  readonly lambdas: Float64Array; // [sample] affine parameter (kept: tangents/momenta recoverable)
+  readonly directions: Float64Array;
+  readonly lambdas: Float64Array;
   readonly positions: Float64Array; // [ray][sample][t,x,y], row-major
-  readonly rayLengths: Int32Array; // [ray] number of valid samples before termination
+  readonly rayLengths: Int32Array;
   readonly rayCount: number;
   readonly sampleCount: number;
 
@@ -65,22 +85,18 @@ export class LightCone {
     this.sampleCount = lambdas.length;
   }
 
-  // Coordinate `c` (0=t, 1=x, 2=y) of the sample at (ray i, sample j).
   coord(i: number, j: number, c: number): number {
     return this.positions[(i * this.sampleCount + j) * 3 + c]!;
   }
 
-  // Ray i as a packed polyline of its valid (t, x, y) samples.
   ray(i: number): Float64Array {
     const start = i * this.sampleCount * 3;
     return this.positions.subarray(start, start + this.rayLengths[i]! * 3);
   }
 
-  // The wavefront at coordinate time `time`: the constant-t slice of the cone
-  // — everywhere the flash has reached by then (plan §4.1). Because t(λ) is
-  // strictly increasing along each ray, this is a per-ray monotone
-  // interpolation, one point per ray that has reached `time`. Returns packed
-  // (t, x, y) triples (t = `time` for all).
+  // The wavefront at coordinate time `time`: the constant-t slice, one point
+  // per ray that has reached it, via monotone per-ray interpolation of t(λ)
+  // (plan §4.1). Packed (t, x, y) triples with t = `time`.
   wavefront(time: number): Float64Array {
     const out: number[] = [];
     for (let i = 0; i < this.rayCount; i += 1) {
@@ -103,9 +119,9 @@ export class LightCone {
   }
 }
 
-// Trace the future light cone of `event`: one null geodesic per emission
-// angle, integrated once and sampled on a shared affine grid. The apex row is
-// exactly `event` for every ray (the cone's degenerate tip).
+// Trace the future light cone of `event`: one null geodesic per emission angle,
+// each traced by its own Solver (the adaptive scheme carries per-ray step
+// state), sampled onto a shared affine grid via `advanceTo`.
 export function lightCone(
   manifold: LorentzianManifold<Event>,
   event: Event,
@@ -115,14 +131,13 @@ export function lightCone(
   if (!Number.isInteger(samples) || samples < 2) {
     throw new RangeError(`lightCone needs samples ≥ 2, got ${samples}`);
   }
-  const substeps = options.substeps ?? 1;
-  const dt = step / substeps;
   const energy = options.energy ?? 1;
   const maxR2 = (options.maxRadius ?? Infinity) ** 2;
-  const makeIntegrator = options.integrator ?? ((f) => new RK4(f));
+  const terminate = options.terminate;
+  const makeMethod = options.method ?? ((f) => new DormandPrince(f));
 
-  const phase = phaseSpace(manifold);
-  const integrator = makeIntegrator(geodesicHamiltonian(manifold));
+  const system = geodesicSystem(manifold);
+  const method = makeMethod(system.field);
   const cone = nullConeAt(manifold, event, { energy });
 
   const nθ = directions.length;
@@ -132,22 +147,29 @@ export function lightCone(
   for (let j = 0; j < nλ; j += 1) lambdas[j] = j * step;
   const rayLengths = new Int32Array(nθ);
 
-  const state = phase.create();
+  const initial = system.phase.create();
   const p = manifold.chart.create();
 
   for (let i = 0; i < nθ; i += 1) {
     cone.momentumInto(p, directions[i]!);
-    state.pos.set(event.t, event.x, event.y);
-    state.mom.set(p.t, p.x, p.y);
+    initial.pos.set(event.t, event.x, event.y);
+    initial.mom.set(p.t, p.x, p.y);
+    const solver = method.solver(initial, 0);
 
-    let valid = 0;
-    for (let j = 0; j < nλ; j += 1) {
-      if (j > 0) integrator.flow(state, dt, substeps);
-      const t = state.pos.t;
-      const x = state.pos.x;
-      const y = state.pos.y;
-      if (!(Number.isFinite(t) && Number.isFinite(x) && Number.isFinite(y)) || x * x + y * y > maxR2) {
-        break; // ray terminated (escaped or plunged into a hole)
+    // apex (λ = 0) is exactly the event for every ray
+    positions[i * nλ * 3] = event.t;
+    positions[i * nλ * 3 + 1] = event.x;
+    positions[i * nλ * 3 + 2] = event.y;
+    let valid = 1;
+
+    for (let j = 1; j < nλ; j += 1) {
+      solver.advanceTo(lambdas[j]!);
+      const st = solver.state;
+      const t = st.pos.t;
+      const x = st.pos.x;
+      const y = st.pos.y;
+      if (!solver.alive || x * x + y * y > maxR2 || (terminate !== undefined && terminate(st))) {
+        break;
       }
       const base = (i * nλ + j) * 3;
       positions[base] = t;
@@ -157,9 +179,7 @@ export function lightCone(
     }
     rayLengths[i] = valid;
 
-    // Pad the remainder with the last valid point so the grid stays
-    // rectangular (a render adapter reads `rayLengths` to skip the padding).
-    const lastBase = (i * nλ + Math.max(valid - 1, 0)) * 3;
+    const lastBase = (i * nλ + (valid - 1)) * 3;
     for (let j = valid; j < nλ; j += 1) {
       const base = (i * nλ + j) * 3;
       positions[base] = positions[lastBase]!;
