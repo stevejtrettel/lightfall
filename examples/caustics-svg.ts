@@ -25,7 +25,8 @@ const { cone } = adaptiveLightCone(M, apex, {
   maxRadius: 40,
   terminate: absorbedNear(holes, 0.12),
   initialRays: 64,
-  toleranceRel: 0.025,
+  sagTol: 0.04, // world units — tight, to catch the razor-thin caustic folds
+  edgeTol: 0.4, // world units — element size over the long trace
   maxRays: 25000,
 });
 

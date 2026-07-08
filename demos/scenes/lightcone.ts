@@ -18,9 +18,10 @@ import {
 
 // Live scene parameters, independent of quality: how far to trace the rays
 // (affine length), how far the emitting observer sits from the hole, and the
-// angular ray budget. Refinement is worst-first against endpoint separation, so
-// raising the budget always spends the new rays between the widest-diverging
-// neighbours first (the shadow edge, the strongly-lensed fans) — not uniformly.
+// angular ray budget. Refinement is worst-first against the surface criteria
+// (flatness, element size, shadow-edge fate), so raising the budget always spends
+// the new rays on the widest-diverging neighbours first (the shadow edge, the
+// strongly-lensed fans) — not uniformly.
 export interface SceneParams {
   lambdaMax: number; // geodesic (affine) length
   observerDistance: number; // apex distance from the hole along −y
@@ -33,16 +34,15 @@ export const DEFAULT_PARAMS: SceneParams = {
   rayBudget: 1000,
 };
 
-// A tiny endpoint cap and a deep angular floor turn refinement into a pure
-// budget-driven, worst-first fill: the heap never "converges", so every ray in
-// the budget goes to the current widest endpoint gap. Shared by all builds.
+// A deep angular floor turns refinement into a pure budget-driven, worst-first
+// fill: with the preset's tight tolerances the heap never "converges", so every
+// ray in the budget goes to the current widest gap. Shared by all builds.
 //
 // The floor is what caps how finely the photon-sphere shadow edge can be
 // subdivided. At 2π/2²⁴ it's deep enough that the *budget* — not the floor —
 // limits the worst gap there (measured: dropping from 2²⁰ to 2²⁴ takes the
 // residual shadow-edge gap from ~1.2 to budget-controlled; integration accuracy
 // is irrelevant, so plain rtol suffices). Deeper buys nothing the budget can't.
-const ENDPOINT_CAP = 0.08;
 const ANGLE_FLOOR = (2 * Math.PI) / 16777216;
 
 export interface SceneHandle {
@@ -115,7 +115,6 @@ export function runLightcone(scene: Scene): SceneHandle {
     const sceneOpts = {
       lambdaMax: params.lambdaMax,
       terminate: absorbedNear(holes, stopRadius * 0.45),
-      maxEscapeGap: ENDPOINT_CAP,
     };
     const tuned: ConeQuality = {
       ...quality,

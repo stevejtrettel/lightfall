@@ -23,7 +23,8 @@ const svgOpts = { width: 820, holes: holes.map((h) => ({ x: h.x, y: h.y, radius:
 const { cone: adaptive, report } = adaptiveLightCone(M, apex, {
   ...shared,
   initialRays: 24,
-  toleranceRel: 0.12,
+  sagTol: 0.05, // world units — chord deviation (lensed folds)
+  edgeTol: 0.2, // world units — even sampling density
   maxRays: 4000,
 });
 writeFileSync("adaptive.svg", coneToSvg(adaptive, svgOpts));
