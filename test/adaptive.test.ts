@@ -22,6 +22,33 @@ function build(overrides: Record<string, number> = {}) {
   });
 }
 
+// Worst separation between neighbouring ESCAPING endpoints — the size of the
+// largest visible triangle in the lensed fan.
+type ConeView = {
+  rayCount: number;
+  sampleCount: number;
+  rayLengths: ArrayLike<number>;
+  coord: (i: number, j: number, c: number) => number;
+};
+function worstEscapeGap(cone: ConeView): number {
+  let max = 0;
+  for (let i = 0; i < cone.rayCount; i += 1) {
+    const j = (i + 1) % cone.rayCount;
+    if (cone.rayLengths[i] !== cone.sampleCount || cone.rayLengths[j] !== cone.sampleCount) continue;
+    const a = cone.rayLengths[i]! - 1;
+    const b = cone.rayLengths[j]! - 1;
+    max = Math.max(
+      max,
+      Math.hypot(
+        cone.coord(i, a, 0) - cone.coord(j, b, 0),
+        cone.coord(i, a, 1) - cone.coord(j, b, 1),
+        cone.coord(i, a, 2) - cone.coord(j, b, 2),
+      ),
+    );
+  }
+  return max;
+}
+
 test("adaptive sampling converges, stays sorted, and leaves no NaNs", () => {
   const { cone, report } = build();
   assert.ok(report.converged, "budget was not exhausted");
@@ -50,6 +77,44 @@ test("rays concentrate toward the lensing hole, not away from it", () => {
   assert.ok(
     towardHole > 2 * awayFromHole,
     `dense toward the hole (${towardHole}) vs away (${awayFromHole})`,
+  );
+});
+
+test("tighter angular tolerance adds rays in the lensed cone (and still converges)", () => {
+  // The full-extent error metric sees the lensed far field, so tightening the
+  // relative tolerance must densify the curved region — this is what the demo's
+  // angular-detail slider drives. A loose vs. tight pass, both under budget.
+  const loose = build({ toleranceRel: 0.15 });
+  const tight = build({ toleranceRel: 0.03, maxRays: 20000 });
+  assert.ok(loose.report.converged && tight.report.converged, "both converge under budget");
+  assert.ok(
+    tight.cone.rayCount > loose.cone.rayCount * 1.3,
+    `tighter tolerance spends more rays (loose ${loose.cone.rayCount}, tight ${tight.cone.rayCount})`,
+  );
+});
+
+test("the escape-gap cap fills stretched-thin fans the curvature test misses", () => {
+  const base = build({ maxRays: 20000 });
+  const capped = build({ maxRays: 20000, maxEscapeGap: 0.6 });
+  assert.ok(capped.report.converged, "converges under the cap");
+  assert.ok(capped.cone.rayCount > base.cone.rayCount, "the cap spends extra rays on the fans");
+  assert.ok(
+    worstEscapeGap(capped.cone) < worstEscapeGap(base.cone),
+    `cap shrinks the worst escaping endpoint gap (base ${worstEscapeGap(base.cone).toFixed(2)}, capped ${worstEscapeGap(capped.cone).toFixed(2)})`,
+  );
+});
+
+test("budget-driven worst-first: more rays close the widest divergers first", () => {
+  // Tiny cap + deep floor ⇒ never converges, so maxRays is the dial and the heap
+  // spends it worst-first. Raising it must shrink the worst endpoint gap — the
+  // demo's "ray budget" slider relies on exactly this.
+  const opts = { maxEscapeGap: 0.05, minAngle: (2 * Math.PI) / 1048576 };
+  const lean = build({ ...opts, maxRays: 250 });
+  const rich = build({ ...opts, maxRays: 2000 });
+  assert.ok(rich.cone.rayCount > lean.cone.rayCount, "the larger budget is actually spent");
+  assert.ok(
+    worstEscapeGap(rich.cone) < worstEscapeGap(lean.cone),
+    `budget closes the widest gap (lean ${worstEscapeGap(lean.cone).toFixed(2)}, rich ${worstEscapeGap(rich.cone).toFixed(2)})`,
   );
 });
 
