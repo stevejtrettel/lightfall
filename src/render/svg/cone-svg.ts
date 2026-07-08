@@ -25,6 +25,9 @@ export interface ConeSvgOptions {
   strokeWidth?: number; // ray stroke, px; default 1
   // Hue each ray by its emission angle (shows the fan structure). Default true.
   colorByAngle?: boolean;
+  // Caustic curve as packed segments (6 floats each: t,x,y, t,x,y) — from
+  // `causticSegments(cone)`. Drawn as a bright overlay.
+  caustics?: Float64Array;
 }
 
 const f = (v: number): string => v.toFixed(2);
@@ -67,6 +70,19 @@ export function coneToSvg(cone: LightCone, options: ConeSvgOptions = {}): string
     parts.push(
       `<polyline points="${pts.trim()}" fill="none" stroke="${stroke}" stroke-width="${strokeWidth}" stroke-opacity="0.85"/>`,
     );
+  }
+
+  // Caustic curve (bright overlay, on top of the rays).
+  const caustics = options.caustics;
+  if (caustics) {
+    for (let s = 0; s < caustics.length; s += 6) {
+      // packed as (t, x, y, t, x, y) — draw the spatial (x, y) projection
+      parts.push(
+        `<line x1="${f(px(caustics[s + 1]!))}" y1="${f(py(caustics[s + 2]!))}" ` +
+          `x2="${f(px(caustics[s + 4]!))}" y2="${f(py(caustics[s + 5]!))}" ` +
+          `stroke="#ffffff" stroke-width="2" stroke-opacity="0.95"/>`,
+      );
+    }
   }
 
   // Holes (filled disks with a bright rim — the horizons).

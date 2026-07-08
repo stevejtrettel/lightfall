@@ -1,7 +1,7 @@
 import type { Scene } from "three";
 
 import { majumdarPapapetrou, Event } from "../../src/spacetime/index.ts";
-import { lightCone, uniformDirections, absorbedNear } from "../../src/lightcone/index.ts";
+import { adaptiveLightCone, absorbedNear } from "../../src/lightcone/index.ts";
 import { ConeMesh, worldtube, timeUp } from "../../src/render/three/index.ts";
 
 export interface SceneResult {
@@ -17,12 +17,14 @@ export function runLightcone(scene: Scene): SceneResult {
   const M = majumdarPapapetrou(holes);
   const apex = Event.of(0, 0, -5);
 
-  const cone = lightCone(M, apex, {
-    directions: uniformDirections(240),
+  const { cone } = adaptiveLightCone(M, apex, {
     samples: 200,
     step: 0.06,
     maxRadius: 12,
     terminate: absorbedNear(holes, 0.35),
+    initialRays: 32,
+    toleranceRel: 0.09,
+    maxRays: 2500,
   });
 
   const embedding = timeUp(0.8);

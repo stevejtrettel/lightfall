@@ -6,3 +6,4 @@ export * from "./samplers.ts";
 export * from "./trace.ts";
 export * from "./light-cone.ts";
 export * from "./adaptive.ts";
+export * from "./caustics.ts";
