@@ -13,25 +13,25 @@ export interface AdaptiveConeOptions {
   maxRadius?: number;
   terminate?: (state: PhaseView<Event>) => boolean;
 
-  // Angular refinement (all defaulted). The split test compares two *absolute*
-  // world-unit tolerances against the surface between neighbouring rays; both are
-  // scene-scaled, so callers pass them as fractions of the trace length (see
-  // buildCone). Measuring absolutely — rather than relative to each gap's own
-  // width — is deliberate: a per-gap ratio treats the trivial circular spreading
-  // of the empty sky as just as "curved" as a real lens, so tightening it to
-  // resolve the hole floods the boring far field with rays. Absolute tolerances
-  // keep the two decoupled: the sky is bounded by edgeTol alone, the lens by
-  // sagTol/fate, so you can sharpen one without paying for the other.
+  // Angular refinement (all defaulted). A gap is ranked by the *element-size*
+  // test: the largest separation between its two bracketing rays anywhere along
+  // their valid extent (edgeSpan). It is absolute (world units) and scene-scaled,
+  // so callers pass it as a fraction of the trace length (see buildCone).
+  // Measuring absolutely — rather than relative to each gap's own width — is
+  // deliberate: a per-gap ratio treats the trivial circular spreading of the
+  // empty sky as just as "curved" as a real lens, flooding the far field when you
+  // tighten to resolve the hole. Absolute keeps sky and lens decoupled.
+  //
+  // Scoring from the two *already-traced* bracketing rays means a gap costs
+  // nothing to rank — the midpoint geodesic is traced only when the gap is
+  // actually cut (one trace per kept ray, not three). A caustic fold where the
+  // neighbours stay close but the surface bows between them is caught one round
+  // late: the instant the gap is cut, the bulging midpoint makes both sub-gaps'
+  // edges large, so they rank high next round.
   initialRays?: number; // seed ring size, default 24
-  // Surface-flatness tolerance (world units): split while the traced midpoint
-  // strand deviates from the neighbour chord by more than this. Catches caustic
-  // folds where neighbours stay close but the surface bows. Default 0.05.
-  sagTol?: number;
   // Element-size tolerance (world units): split while neighbouring strands are
   // farther apart than this anywhere along their valid extent. Bounds triangle
-  // size ⇒ even sampling, and fills the stretched-thin lensed fans that the sag
-  // test alone misses (a big flat triangle has low sag but a large edge).
-  // Default 0.1.
+  // size ⇒ even sampling, and fills the stretched-thin lensed fans.
   edgeTol?: number;
   minAngle?: number; // hard angular floor on gap width, default 2π/2048
   maxRays?: number; // ray budget, default 3000
@@ -58,35 +58,13 @@ interface Entry {
   strand: Strand;
 }
 
-// Maximum deviation of the midpoint strand from the chord of its neighbors, in
-// intrinsic (t, x, y) — the surface's flatness error. Measured over the common
-// VALID extent (min of the three lengths), never the padded tail: past
-// termination the strands are frozen at their last point (trace.ts), which is
-// fake geometry. When lengths diverge (one ray plunges in while its neighbours
-// wind on) the fate test below fires with ∞ priority and refines that boundary,
-// so the honest common-extent window loses nothing there while staying free of
-// padding artefacts.
-function sagError(lo: Strand, mid: Strand, hi: Strand): number {
-  const n = Math.min(lo.length, mid.length, hi.length);
-  const a = lo.positions;
-  const b = mid.positions;
-  const c = hi.positions;
-  let max = 0;
-  for (let j = 0; j < n; j += 1) {
-    const o = j * 3;
-    const ex = b[o]! - 0.5 * (a[o]! + c[o]!);
-    const ey = b[o + 1]! - 0.5 * (a[o + 1]! + c[o + 1]!);
-    const et = b[o + 2]! - 0.5 * (a[o + 2]! + c[o + 2]!);
-    const e = Math.sqrt(ex * ex + ey * ey + et * et);
-    if (e > max) max = e;
-  }
-  return max;
-}
-
 // Largest separation between two neighbouring strands over their common valid
-// extent — the widest triangle edge the gap would leave. Absorbed rays count
-// only up to the point they were absorbed (real, visible geometry); their frozen
-// tails are excluded.
+// extent — the widest triangle edge the gap would leave, and the sole refinement
+// criterion (besides fate). Because divergence is monotone for ~99% of gaps the
+// max usually sits at the far end, but scanning the whole extent is free (it
+// reads points already computed) and catches the ~1% caustic gaps where the rays
+// cross and re-diverge, so the max is interior. Absorbed rays count only up to
+// the point they were absorbed (real, visible geometry); frozen tails excluded.
 function edgeSpan(lo: Strand, hi: Strand): number {
   const n = Math.min(lo.length, hi.length);
   const a = lo.positions;
@@ -103,19 +81,17 @@ function edgeSpan(lo: Strand, hi: Strand): number {
   return max;
 }
 
-// One angular gap under consideration: its two bracketing rays and the already-
-// traced midpoint that would split it, ranked by `priority` — how far the
-// midpoint exceeds the local tolerance (∞ for a fate boundary). Refinement pops
-// the highest-priority gap globally, so a fixed ray budget lands on the most
-// non-linear gaps everywhere rather than being spent depth-first on the first
-// fold it descends into.
+// One angular gap under consideration: its two bracketing rays, ranked by
+// `priority` — how far the edge between them exceeds edgeTol (∞ for a fate
+// boundary). Ranked from the already-traced brackets alone, so no geodesic is
+// traced until the gap is popped and cut. Refinement pops the highest-priority
+// gap globally, so a fixed ray budget lands on the widest edges everywhere
+// rather than being spent depth-first on the first fold it descends into.
 interface Gap {
   loT: number;
   loS: Strand;
   hiT: number;
   hiS: Strand;
-  midT: number;
-  midS: Strand;
   priority: number;
 }
 
@@ -161,20 +137,20 @@ class GapHeap {
 
 // Choose emission angles adaptively: seed a coarse ring, then repeatedly split
 // the globally worst gap until the ray budget runs out or the angular floor is
-// hit. A gap's badness is the largest of three criterion ratios (see makeGap):
+// hit. A gap's badness is the larger of two criterion ratios (see makeGap):
 //   • fate mismatch (∞) — neighbours with divergent fates, the shadow boundary;
-//   • curvature — midpoint deviating from the neighbour chord vs. sagTol;
-//   • element size — neighbours drifting apart vs. edgeTol.
-// Both length criteria are absolute (world units), so the boring far field and
-// the lensed core refine independently. With a tiny edgeTol and a deep minAngle
-// this is a pure budget-driven, worst-first fill: every ray lands in the current
-// widest gap. See docs/plans/adaptive-angular-sampling.md.
+//   • element size — the widest separation between the two bracketing rays vs.
+//     edgeTol (edgeSpan).
+// edgeSpan reads only the already-traced brackets, so a gap is free to rank; the
+// midpoint geodesic is traced only when the gap is cut (one trace per kept ray).
+// With a tiny edgeTol and a deep minAngle this is a pure budget-driven, worst-
+// first fill: every ray lands in the current widest gap. See
+// docs/plans/adaptive-angular-sampling.md.
 export function adaptiveDirections(
   tracer: RayTracer,
   options: AdaptiveConeOptions,
 ): { thetas: number[]; strands: Strand[]; report: AdaptiveReport } {
   const n0 = options.initialRays ?? 24;
-  const sagTol = options.sagTol ?? 0.05;
   const edgeTol = options.edgeTol ?? 0.1;
   const minAngle = options.minAngle ?? TWO_PI / 2048;
   const maxRays = options.maxRays ?? 3000;
@@ -194,18 +170,12 @@ export function adaptiveDirections(
   let kept = n0;
   let converged = true;
 
-  // Trace a gap's midpoint and score it. `priority` is the max of the criterion
-  // ratios (each ≥ 1 means "needs splitting"): ∞ for a fate mismatch so shadow
-  // edges refine first; the curvature ratio sagError/sagTol; and the element-size
-  // ratio edgeSpan/edgeTol. The traced midpoint rides on the gap so an accepted
-  // split reuses it instead of re-tracing.
+  // Score a gap from its two bracketing rays alone — no midpoint traced. The
+  // `priority` (≥ 1 means "needs splitting") is ∞ for a fate mismatch so shadow
+  // edges refine first, else the element-size ratio edgeSpan/edgeTol.
   const makeGap = (loT: number, loS: Strand, hiT: number, hiS: Strand): Gap => {
-    const midT = 0.5 * (loT + hiT);
-    const midS = tracer.trace(midT);
-    const priority = fateMismatch(loS, hiS)
-      ? Infinity
-      : Math.max(sagError(loS, midS, hiS) / sagTol, edgeSpan(loS, hiS) / edgeTol);
-    return { loT, loS, hiT, hiS, midT, midS, priority };
+    const priority = fateMismatch(loS, hiS) ? Infinity : edgeSpan(loS, hiS) / edgeTol;
+    return { loT, loS, hiT, hiS, priority };
   };
 
   const heap = new GapHeap();
@@ -223,10 +193,15 @@ export function adaptiveDirections(
       converged = false;
       break;
     }
+    // Only now, on an accepted cut, is the midpoint geodesic traced — the single
+    // trace this split costs. The two sub-gaps are ranked from it and its
+    // neighbours, so a fold it reveals surfaces as large sub-gap edges next round.
+    const midT = 0.5 * (g.loT + g.hiT);
+    const midS = tracer.trace(midT);
     kept += 1;
-    inserted.push({ theta: g.midT, strand: g.midS });
-    heap.push(makeGap(g.loT, g.loS, g.midT, g.midS));
-    heap.push(makeGap(g.midT, g.midS, g.hiT, g.hiS));
+    inserted.push({ theta: midT, strand: midS });
+    heap.push(makeGap(g.loT, g.loS, midT, midS));
+    heap.push(makeGap(midT, midS, g.hiT, g.hiS));
   }
 
   const all = [...seed, ...inserted].map((e) => ({

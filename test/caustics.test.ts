@@ -33,7 +33,6 @@ test("weak/degenerate lensing has no extractable caustic curve", () => {
     maxRadius: 13,
     terminate: absorbedNear(holes, 0.3),
     initialRays: 32,
-    sagTol: 0.05,
     edgeTol: 0.2,
     maxRays: 4000,
   });
@@ -55,7 +54,6 @@ test("strong lensing folds the congruence — the Jacobian crosses zero", () => 
     maxRadius: 40,
     terminate: absorbedNear(holes, 0.12),
     initialRays: 64,
-    sagTol: 0.04,
     edgeTol: 0.4,
     maxRays: 25000,
   });

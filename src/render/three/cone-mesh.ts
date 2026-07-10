@@ -4,28 +4,33 @@ import {
   Color,
   DoubleSide,
   Mesh,
-  MeshStandardMaterial,
+  MeshPhysicalMaterial,
 } from "three";
 
 import { Matrix } from "../../math/linalg/index.ts";
 import type { LightCone } from "../../lightcone/index.ts";
 import { timeUp, type SpacetimeEmbedding } from "./embedding.ts";
+import { shiftColor, type RedshiftOptions } from "./redshift.ts";
 
 export type ConeColorMode = "solid" | "redshift";
 
 export interface ConeTrim {
-  // Cylinder centers in spatial (x, y) — the holes.
-  centers: readonly { x: number; y: number }[];
-  // The stop radius. The surface is cut cleanly on this circle around each
-  // center (the worldtube). Requires rays traced slightly inside it.
-  radius: number;
+  // Cylinder centers in spatial (x, y) — the holes. Each may carry its own cut
+  // radius (so tubes can scale with mass); centers without one fall back to the
+  // shared `radius`.
+  centers: readonly { x: number; y: number; radius?: number }[];
+  // Shared fallback stop radius for centers that don't specify their own. The
+  // surface is cut cleanly on this circle; rays must be traced slightly inside.
+  radius?: number;
 }
 
 export interface ConeMeshOptions {
   embedding?: SpacetimeEmbedding;
   color?: number;
   colorMode?: ConeColorMode;
-  redshiftScale?: number;
+  // Tuning for the backward-cone redshift colouring (source wavelength and
+  // exaggeration). See redshift.ts.
+  redshift?: RedshiftOptions;
   // Trim the surface against the stop cylinders for a clean cut at the holes.
   trim?: ConeTrim;
   // Tear the surface where adjacent rays terminate at different lengths (leaves
@@ -43,7 +48,7 @@ export interface ConeMeshOptions {
 // optionally trimmed against the stop cylinders so the surface cuts cleanly on
 // the tube radius instead of ending in a ragged, grid-aligned tear.
 export class ConeMesh extends Mesh {
-  private readonly mat: MeshStandardMaterial;
+  private readonly mat: MeshPhysicalMaterial;
   private readonly solidColor: Color;
 
   constructor(cone: LightCone, options: ConeMeshOptions = {}) {
@@ -54,16 +59,19 @@ export class ConeMesh extends Mesh {
     const geometry = buildConeGeometry(
       cone,
       embedding,
-      options.redshiftScale ?? 3,
+      options.redshift ?? {},
       options.trim,
       options.tear ?? !hasTrim,
     );
     const solidColor = new Color(options.color ?? 0xf5c542);
-    const mat = new MeshStandardMaterial({
+    // Glossy clearcoat, matching the charged-blackholes hero surface.
+    const mat = new MeshPhysicalMaterial({
       color: solidColor,
       side: DoubleSide,
-      roughness: 0.35,
+      roughness: 0.05,
       metalness: 0.0,
+      clearcoat: 1.0,
+      clearcoatRoughness: 0.1,
       vertexColors: false,
     });
     super(geometry, mat);
@@ -100,7 +108,7 @@ interface Vertex {
 function buildConeGeometry(
   cone: LightCone,
   embedding: SpacetimeEmbedding,
-  redshiftScale: number,
+  redshift: RedshiftOptions,
   trim: ConeTrim | undefined,
   tear: boolean,
 ): BufferGeometry {
@@ -112,9 +120,60 @@ function buildConeGeometry(
   const G = Matrix.square(cone.manifold.dimension);
   const timeIndex = cone.manifold.timeIndex;
   const event = cone.manifold.chart.create();
-  const near = new Color(0x4aa8ff);
-  const far = new Color(0xffb03a);
   const tmp = new Color();
+
+  // The static-observer frequency factor rf = √(−gᵗᵗ) at a chart point.
+  const frequencyFactor = (t: number, x: number, y: number): number => {
+    event.set(t, x, y);
+    cone.manifold.metric.gInverseInto(G, event);
+    return Math.sqrt(Math.max(-G.get(timeIndex, timeIndex), 0));
+  };
+
+  // Does a spatial point lie inside a stop cylinder (a black-hole throat)? Used
+  // to tell rays that were absorbed from rays that escaped.
+  const endsInHole = (x: number, y: number): boolean => {
+    if (!trim) return false;
+    for (const ctr of trim.centers) {
+      const R = ctr.radius ?? trim.radius ?? 0;
+      const dx = x - ctr.x;
+      const dy = y - ctr.y;
+      if (dx * dx + dy * dy < R * R) return true;
+    }
+    return false;
+  };
+
+  // How each vertex's shift ratio is formed.
+  //   "edge":     ratio = rf(x) / rf(source) — accumulated from each ray's own
+  //               integration endpoint (history-dependent).
+  //   "depth":    ratio = rf(observer) / rf(x) — gravitational shift by depth
+  //               relative to the observer's potential (yellow at the apex
+  //               depth, red deeper, blue shallower); continuous, no shadow seam.
+  //   "infinity": ratio = rf(x) / rf(source), but with source = spatial infinity
+  //               (rf → 1) for rays that escape — so escaped light reads as a
+  //               pure depth-blueshift map, U(x), independent of where the trace
+  //               stopped. Rays that fall into a hole didn't come from infinity;
+  //               they keep their true near-throat source (edge behaviour) and
+  //               read deep red — the shadow.
+  const anchor = redshift.anchor ?? "edge";
+  const referenceRf =
+    anchor === "depth"
+      ? Math.max(frequencyFactor(cone.apexT, cone.apexX, cone.apexY), 1e-9)
+      : 1;
+  // Default source rf = 1 (spatial infinity, U → 1); "edge" and absorbed
+  // "infinity" rays overwrite it with their integration endpoint's rf.
+  const sourceRf = new Float64Array(nT).fill(1);
+  if (anchor === "edge" || anchor === "infinity") {
+    for (let i = 0; i < nT; i += 1) {
+      const jEnd = Math.max(cone.rayLengths[i]! - 1, 0);
+      const endX = cone.coord(i, jEnd, 1);
+      const endY = cone.coord(i, jEnd, 2);
+      // "infinity" only anchors to the endpoint for rays that were swallowed;
+      // escaped rays keep the infinity reference (rf = 1).
+      if (anchor === "infinity" && !endsInHole(endX, endY)) continue;
+      const rf = frequencyFactor(cone.coord(i, jEnd, 0), endX, endY);
+      sourceRf[i] = rf > 0 ? rf : 1;
+    }
+  }
 
   for (let i = 0; i < nT; i += 1) {
     for (let j = 0; j < nL; j += 1) {
@@ -124,11 +183,9 @@ function buildConeGeometry(
       const y = cone.coord(i, j, 2);
       embedding.embedInto(positions, vi * 3, t, x, y);
 
-      event.set(t, x, y);
-      cone.manifold.metric.gInverseInto(G, event);
-      const rf = Math.sqrt(Math.max(-G.get(timeIndex, timeIndex), 0));
-      const s = Math.min(Math.max((rf - 1) / (redshiftScale - 1), 0), 1);
-      tmp.copy(far).lerp(near, s);
+      const rfx = Math.max(frequencyFactor(t, x, y), 1e-9);
+      const ratio = anchor === "depth" ? referenceRf / rfx : rfx / sourceRf[i]!;
+      shiftColor(tmp, ratio, redshift);
       colors[vi * 3] = tmp.r;
       colors[vi * 3 + 1] = tmp.g;
       colors[vi * 3 + 2] = tmp.b;
@@ -149,7 +206,10 @@ function buildConeGeometry(
   const geometry = new BufferGeometry();
   if (!trim || trim.centers.length === 0) {
     geometry.setAttribute("position", new BufferAttribute(positions, 3));
-    geometry.setAttribute("color", new BufferAttribute(colors, 3));
+    // RGBA (alpha = 1): three-gpu-pathtracer samples vertex colour as a vec4 and
+    // multiplies it into albedo — a 3-component attribute reads alpha 0 and the
+    // surface turns transparent/black under path tracing.
+    geometry.setAttribute("color", new BufferAttribute(rgbaFrom(colors), 4));
     geometry.setAttribute("normal", new BufferAttribute(normals.slice(), 3));
     geometry.setIndex(new BufferAttribute(Uint32Array.from(index), 1));
     geometry.computeBoundingSphere();
@@ -157,8 +217,9 @@ function buildConeGeometry(
   }
 
   // Trim near-hole triangles against the stop cylinders; leave the rest indexed
-  // on the original grid vertices.
-  const R = trim.radius;
+  // on the original grid vertices. Each center's radius is its own, or the
+  // shared fallback.
+  const radiusOf = (ctr: { radius?: number }): number => ctr.radius ?? trim.radius ?? 0;
   const centers = trim.centers;
   const outIndex: number[] = [];
   const extraP: number[] = [];
@@ -181,6 +242,7 @@ function buildConeGeometry(
   // clipping; otherwise it's fully outside and stays as-is.)
   const insideAny = (ia: number, ib: number, ic: number): boolean => {
     for (const ctr of centers) {
+      const R = radiusOf(ctr);
       for (const vi of [ia, ib, ic]) {
         const dx = positions[vi * 3]! - ctr.x;
         const dy = positions[vi * 3 + 2]! - ctr.y; // spatial y is world z
@@ -201,6 +263,7 @@ function buildConeGeometry(
     let tris: Vertex[][] = [[readVertex(ia), readVertex(ib), readVertex(ic)]];
     for (const ctr of centers) {
       const next: Vertex[][] = [];
+      const R = radiusOf(ctr);
       for (const tri of tris) clipTriangleOutsideDisk(tri, ctr.x, ctr.y, R, next);
       tris = next;
     }
@@ -213,7 +276,7 @@ function buildConeGeometry(
   const finalC = concatFloat32(colors, extraC);
   const finalN = concatFloat32(normals, extraN);
   geometry.setAttribute("position", new BufferAttribute(finalP, 3));
-  geometry.setAttribute("color", new BufferAttribute(finalC, 3));
+  geometry.setAttribute("color", new BufferAttribute(rgbaFrom(finalC), 4));
   geometry.setAttribute("normal", new BufferAttribute(finalN, 3));
   geometry.setIndex(new BufferAttribute(Uint32Array.from(outIndex), 1));
   geometry.computeBoundingSphere();
@@ -314,6 +377,20 @@ function lerpVertex(a: Vertex, b: Vertex, t: number): Vertex {
   const n = lerp3(a.n, b.n);
   const len = Math.hypot(n[0], n[1], n[2]) || 1;
   return { p: lerp3(a.p, b.p), c: lerp3(a.c, b.c), n: [n[0] / len, n[1] / len, n[2] / len] };
+}
+
+// Expand a packed RGB array to RGBA with alpha 1 (the vertex-colour format the
+// path tracer expects).
+function rgbaFrom(rgb: Float32Array): Float32Array {
+  const n = rgb.length / 3;
+  const out = new Float32Array(n * 4);
+  for (let i = 0; i < n; i += 1) {
+    out[i * 4] = rgb[i * 3]!;
+    out[i * 4 + 1] = rgb[i * 3 + 1]!;
+    out[i * 4 + 2] = rgb[i * 3 + 2]!;
+    out[i * 4 + 3] = 1;
+  }
+  return out;
 }
 
 function concatFloat32(base: Float32Array, extra: number[]): Float32Array {

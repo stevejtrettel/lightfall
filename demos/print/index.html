@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>lightfall — print export</title>
+    <style>
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0a0f;
+        font-family: system-ui, sans-serif; color: #e8e8ee; }
+      #canvas { display: block; width: 100vw; height: 100vh; }
+      #panel { position: fixed; top: 12px; left: 12px; width: 220px; padding: 14px 16px;
+        background: rgba(18, 18, 26, 0.82); border: 1px solid #2a2a36; border-radius: 10px;
+        backdrop-filter: blur(6px); font-size: 13px; }
+      #panel h1 { font-size: 13px; font-weight: 600; margin: 0 0 10px; letter-spacing: 0.02em; }
+      .row { display: flex; align-items: center; justify-content: space-between; margin: 8px 0; gap: 8px; }
+      .row label { color: #b8b8c4; }
+      .row input[type="range"] { flex: 1; }
+      .val { min-width: 34px; text-align: right; color: #9fd0ff; font-variant-numeric: tabular-nums; }
+      button { width: 100%; margin-top: 10px; padding: 8px; font-size: 13px; font-weight: 600;
+        color: #0a0a0f; background: #9fd0ff; border: none; border-radius: 8px; cursor: pointer; }
+      button:hover { background: #bfe0ff; }
+      .link { color: #8892b0; font-size: 12px; text-decoration: none; }
+      .link:hover { color: #b8b8c4; }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+    <div id="panel">
+      <h1>print export — single black hole</h1>
+      <a class="link" href="/">← all demos</a>
+      <div class="row" style="margin-top: 12px;">
+        <label for="rod">rod length</label>
+        <input id="rod" type="range" min="4" max="40" step="0.5" />
+        <span class="val" id="rodVal"></span>
+      </div>
+      <div class="row">
+        <label for="detail">detail</label>
+        <input id="detail" type="range" min="800" max="12000" step="100" />
+        <span class="val" id="detailVal"></span>
+      </div>
+      <div class="row">
+        <label for="tube">rim tube</label>
+        <input id="tube" type="checkbox" />
+        <span class="val"></span>
+      </div>
+      <button id="export">export OBJ</button>
+    </div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

@@ -11,11 +11,9 @@ import type { LightCone, Terminator } from "./light-cone.ts";
 // what lets refine catch the thin features coarse misses.
 export interface ConeQuality {
   initialRays: number; // seed ring — density here decides which thin features are found
-  // Refinement tolerances, as fractions of the trace length (lambdaMax); buildCone
-  // scales them to absolute world units. Both are absolute-per-gap once scaled, so
-  // the empty far field and the lensed core refine independently — tightening one
-  // never floods the other (see adaptive.ts).
-  sagTol: number; // surface-flatness tolerance (chord deviation) — resolves folds/lensing
+  // Refinement tolerance, as a fraction of the trace length (lambdaMax); buildCone
+  // scales it to absolute world units. Absolute-per-gap once scaled, so the empty
+  // far field and the lensed core refine independently (see adaptive.ts).
   edgeTol: number; // element-size tolerance (neighbour separation) — sets the even sampling density
   maxRays: number; // budget
   samples: number; // λ samples per ray (cheap — DOPRI5 already adapts internally)
@@ -30,8 +28,7 @@ export interface ConeQuality {
 // Interactive: sub-second, good enough to orbit.
 export const COARSE_CONE: ConeQuality = {
   initialRays: 40,
-  sagTol: 0.01, // ~1% of the trace length — smooth enough to orbit
-  edgeTol: 0.02, // ~2% — evenly sampled without a heavy ray count
+  edgeTol: 0.02, // ~2% of the trace length — evenly sampled without a heavy ray count
   maxRays: 800,
   // λ samples per ray. Enough to keep the fast-climbing near-horizon region
   // smooth (dt/dλ = U² is large there), but no more: meshing cost scales with
@@ -42,14 +39,13 @@ export const COARSE_CONE: ConeQuality = {
   atol: 1e-9,
 };
 
-// Hero still. Dense seed brackets thin folds/edges; tight tolerances and a big
+// Hero still. Dense seed brackets thin folds/edges; a tight edgeTol and a big
 // budget so complex/strong-lensing scenes actually spend it; fine λ mesh and
 // tight integration. On a smooth scene it converges early and stays fast; on a
-// rich one it scales up to thousands of rays. The tight sagTol sharpens the
-// lensed core; edgeTol stays moderate so the calm sky is *not* over-refined.
+// rich one it scales up to thousands of rays. The dense seed is what brackets a
+// razor-thin fold — refinement only subdivides gaps a seed ray already straddles.
 export const REFINE_CONE: ConeQuality = {
   initialRays: 220,
-  sagTol: 0.0005,
   edgeTol: 0.008,
   maxRays: 30000,
   samples: 2000,
@@ -74,13 +70,12 @@ export function buildCone(
   scene: ConeSceneOptions,
 ): { cone: LightCone; report: AdaptiveReport } {
   const step = scene.lambdaMax / (quality.samples - 1);
-  // The refinement tolerances are fractions of the trace length; scale them to
-  // the absolute world units adaptive.ts compares against.
+  // The refinement tolerance is a fraction of the trace length; scale it to the
+  // absolute world units adaptive.ts compares against.
   return adaptiveLightCone(manifold, event, {
     samples: quality.samples,
     step,
     initialRays: quality.initialRays,
-    sagTol: quality.sagTol * scene.lambdaMax,
     edgeTol: quality.edgeTol * scene.lambdaMax,
     maxRays: quality.maxRays,
     ...(quality.minAngle !== undefined ? { minAngle: quality.minAngle } : {}),

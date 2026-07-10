@@ -1,199 +1,385 @@
-import type { Mesh, Scene } from "three";
+import { Group, Mesh } from "three";
 
 import { majumdarPapapetrou, Event } from "../../src/spacetime/index.ts";
 import {
   buildCone,
   COARSE_CONE,
-  absorbedNear,
+  REFINE_CONE,
+  absorbedWithin,
   type ConeQuality,
   type LightCone,
 } from "../../src/lightcone/index.ts";
 import {
   ConeMesh,
   ConeRays,
+  EndTube,
   worldtube,
   timeUp,
   type ConeColorMode,
+  type RedshiftAnchor,
 } from "../../src/render/three/index.ts";
 
-// Live scene parameters, independent of quality: how far to trace the rays
-// (affine length), how far the emitting observer sits from the hole, and the
-// angular ray budget. Refinement is worst-first against the surface criteria
-// (flatness, element size, shadow-edge fate), so raising the budget always spends
-// the new rays on the widest-diverging neighbours first (the shadow edge, the
-// strongly-lensed fans) — not uniformly.
-export interface SceneParams {
-  lambdaMax: number; // geodesic (affine) length
-  observerDistance: number; // apex distance from the hole along −y
-  rayBudget: number; // max angular rays; worst-first fills widest gaps first
+// A spatial black hole: mass and (x, y). The metric, the terminator, and the
+// worldtube all consume this shape.
+export interface Hole {
+  mass: number;
+  x: number;
+  y: number;
 }
 
-export const DEFAULT_PARAMS: SceneParams = {
-  lambdaMax: 12,
-  observerDistance: 5,
-  rayBudget: 1000,
-};
+// A cut/horizon circle in the spatial plane, sized per hole.
+export interface Horizon {
+  x: number;
+  y: number;
+  radius: number;
+}
 
-// A deep angular floor turns refinement into a pure budget-driven, worst-first
-// fill: with the preset's tight tolerances the heap never "converges", so every
-// ray in the budget goes to the current widest gap. Shared by all builds.
-//
-// The floor is what caps how finely the photon-sphere shadow edge can be
-// subdivided. At 2π/2²⁴ it's deep enough that the *budget* — not the floor —
-// limits the worst gap there (measured: dropping from 2²⁰ to 2²⁴ takes the
-// residual shadow-edge gap from ~1.2 to budget-controlled; integration accuracy
-// is irrelevant, so plain rtol suffices). Deeper buys nothing the budget can't.
-const ANGLE_FLOOR = (2 * Math.PI) / 16777216;
+// The full, editable state of a lightcone scene — the single source of truth.
+// Everything the render shows is a pure function of this. `update()` classifies
+// which fields changed and does the cheapest sufficient recompute.
+export interface LightconeState {
+  // The metric: the holes and where the observer sits (apex at t = 0).
+  holes: Hole[];
+  observer: { x: number; y: number };
+  // Embedding: vertical stretch of the time axis (cheap — no re-trace).
+  timeScale: number;
+  // Tracing: how far the null geodesics run and the adaptive ray budget.
+  lambdaMax: number;
+  rayBudget: number;
+  quality: "coarse" | "refine";
+  // Appearance.
+  colorMode: ConeColorMode;
+  showTube: boolean;
+  showRays: boolean;
+  // Redshift colouring: saturation scale, exaggeration, and where "yellow" is
+  // anchored (each ray's edge, or a fixed far-field reference).
+  redshift: { scale: number; exaggeration: number; anchor: RedshiftAnchor };
+}
 
-export interface SceneHandle {
+// A demo scene config: the fixed scenario (holes, sheets, framing) plus initial
+// state overrides. The engine is identical across demos — only this differs.
+export interface LightconeSceneConfig {
   label: string;
-  camera: { position: [number, number, number]; target: [number, number, number] };
-  setColorMode(mode: ConeColorMode): void;
-  // Toggle the traced-ray overlay (cheap: reuses the last built cone).
-  setShowRays(show: boolean): void;
-  // Rebuild at a new quality (coarse ↔ refine).
-  rebuild(quality: ConeQuality): BuildResult;
-  // Live scene knobs. Each rebuilds at the current quality.
-  setParams(params: Partial<SceneParams>): BuildResult;
-  params: SceneParams;
+  holes: readonly Hole[];
+  mode?: "future" | "double";
+  // Base horizon radius at mass 1; per-hole radius scales as base·√mass.
+  stopRadius?: number;
+  timeScale?: number;
+  defaults?: Partial<LightconeState>;
+  camera?: {
+    position: [number, number, number];
+    target?: [number, number, number];
+  };
+  // How far the studio's right (side) wall sits behind the cone (fraction of
+  // radius); presentation only. Defaults to 0.35.
+  sideWallMargin?: number;
 }
 
-// What a rebuild reports back to the UI: the ray count and the widest remaining
-// stretched-thin gap (world units; plateaus at the photon sphere).
 export interface BuildResult {
   rays: number;
   worstGap: number;
 }
 
-// The MVP scene: the lensed light cone of an event near a single Majumdar–
-// Papapetrou black hole, rising in time, with the horizon worldtube. Owns its
-// scene objects so it can swap the cone between quality levels live.
-export function runLightcone(scene: Scene): SceneHandle {
-  const holes = [{ mass: 1, x: 0, y: 0 }];
-  const M = majumdarPapapetrou(holes);
-  // The surface is cut cleanly on `stopRadius` (the tube). Rays terminate a bit
-  // inside it so the mesh has geometry straddling the cut.
-  const stopRadius = 0.4;
-  const embedding = timeUp(0.4);
+export interface SceneCallbacks {
+  // The scene graph changed (geometry rebuilt / objects toggled): rebuild BVH.
+  onGeometry?: () => void;
+  // Only materials changed (colour mode).
+  onMaterials?: () => void;
+}
 
-  const params: SceneParams = { ...DEFAULT_PARAMS };
-  let quality: ConeQuality = COARSE_CONE;
+// The two sheet colours: future rises in gold, past falls in orange.
+const FUTURE_COLOR = 0xf5c542;
+const PAST_COLOR = 0xff770f;
 
-  let mesh: ConeMesh | undefined;
-  let rays: ConeRays | undefined;
-  let lastCone: LightCone | undefined;
-  let tubes: Mesh[] = [];
-  let colorMode: ConeColorMode = "solid";
-  let showRays = false;
-  let target: [number, number, number] = [0, 4, -3];
+// A deep angular floor turns refinement into a pure budget-driven, worst-first
+// fill (see the notes in quality.ts / the adaptive sampler).
+const ANGLE_FLOOR = (2 * Math.PI) / 16777216;
 
-  // Add/remove the traced-ray overlay to match `showRays`, reusing the last
-  // built cone so toggling it never recomputes geodesics.
-  const syncRays = (): void => {
-    if (rays) {
-      scene.remove(rays);
-      rays.dispose();
-      rays = undefined;
-    }
-    if (showRays && lastCone) {
-      rays = new ConeRays(lastCone, { embedding, clipRadius: stopRadius, centers: holes });
-      scene.add(rays);
-    }
-  };
+// Smallest visible horizon, so a nearly massless hole still shows a throat.
+const MIN_HORIZON = 0.05;
 
-  const build = (): BuildResult => {
-    if (mesh) {
-      scene.remove(mesh);
-      mesh.dispose();
-    }
-    for (const t of tubes) scene.remove(t);
-    tubes = [];
+// Geometry is baked at unit time scale; vertical stretch is applied as a
+// group Y-scale, so changing it never rebuilds geometry.
+const REF_EMBEDDING = timeUp(1);
 
-    // Apex sits distance `observerDistance` from the hole along −y; rays are
-    // traced for affine length `lambdaMax`.
-    const apex = Event.of(0, 0, -params.observerDistance);
-    const sceneOpts = {
-      lambdaMax: params.lambdaMax,
-      terminate: absorbedNear(holes, stopRadius * 0.45),
+const DEFAULT_STATE: LightconeState = {
+  holes: [],
+  observer: { x: 0, y: -5 },
+  // Time-dominant so the (horizontally-drawn) cone reads elongated like the
+  // charged-blackholes reference rather than squat. Stretch is distortion-free.
+  timeScale: 0.9,
+  lambdaMax: 12,
+  rayBudget: 1000,
+  quality: "coarse",
+  colorMode: "solid",
+  showTube: true,
+  showRays: false,
+  redshift: { scale: 1.5, exaggeration: 1, anchor: "depth" },
+};
+
+// Per-hole horizon radius: scales with mass so heavier holes read as bigger
+// throats, with a floor so the lightest never vanishes.
+export function horizonRadius(mass: number, base: number): number {
+  return Math.max(base * Math.sqrt(Math.max(mass, 0)), MIN_HORIZON);
+}
+
+const LEVEL = { material: 1, visibility: 2, stretch: 3, recolor: 4, trace: 5 } as const;
+
+// Which recompute level a state key demands. Vertical stretch is only a Y-scale
+// of already-built geometry (never rebuilds); a redshift tweak rebuilds geometry
+// from the cached cones (recolours, no re-trace); metric/tracing edits re-trace.
+function levelOf(key: keyof LightconeState): number {
+  switch (key) {
+    case "colorMode": return LEVEL.material;
+    case "showTube":
+    case "showRays": return LEVEL.visibility;
+    case "timeScale": return LEVEL.stretch;
+    case "redshift": return LEVEL.recolor;
+    default: return LEVEL.trace; // holes, observer, lambdaMax, rayBudget, quality
+  }
+}
+
+// The lightcone as a live, editable model. Owns the traced cones and all the
+// three.js objects (surface, rim tube, worldtubes, rays) under one Group. Edits
+// go through `update(patch)`, which re-traces geodesics only when the metric or
+// tracing parameters change; a vertical-stretch edit merely re-embeds the cached
+// cones, and colour/visibility edits are cheaper still.
+export class LightconeScene {
+  readonly group = new Group();
+  readonly state: LightconeState;
+
+  private readonly config: LightconeSceneConfig;
+  private readonly stopBase: number;
+  private readonly energies: (number | undefined)[];
+  private readonly sheetColors: number[];
+  private readonly callbacks: SceneCallbacks;
+
+  private cones: LightCone[] = [];
+  private meshes: ConeMesh[] = [];
+  private endTubes: EndTube[] = [];
+  private worldtubes: Mesh[] = [];
+  private rays: ConeRays[] = [];
+  private report: BuildResult = { rays: 0, worstGap: 0 };
+  private target: [number, number, number] = [0, 4, -3];
+  // Vertical mid-time of the content in reference (unstretched) coordinates.
+  private centerT = 0;
+
+  constructor(config: LightconeSceneConfig, callbacks: SceneCallbacks = {}) {
+    this.config = config;
+    this.callbacks = callbacks;
+    this.stopBase = config.stopRadius ?? 0.3;
+    const isDouble = config.mode === "double";
+    this.energies = isDouble ? [undefined, -1] : [undefined];
+    this.sheetColors = isDouble ? [FUTURE_COLOR, PAST_COLOR] : [FUTURE_COLOR];
+
+    this.state = {
+      ...DEFAULT_STATE,
+      ...config.defaults,
+      timeScale: config.timeScale ?? config.defaults?.timeScale ?? DEFAULT_STATE.timeScale,
+      observer: { ...DEFAULT_STATE.observer, ...config.defaults?.observer },
+      holes: config.holes.map((h) => ({ ...h })),
     };
+
+    this.trace();
+  }
+
+  // ---- editing -------------------------------------------------------------
+
+  // Merge a patch into the state and recompute at the cheapest sufficient level.
+  update(patch: Partial<LightconeState>): BuildResult {
+    let level = 0;
+    for (const key of Object.keys(patch) as (keyof LightconeState)[]) {
+      level = Math.max(level, levelOf(key));
+    }
+    Object.assign(this.state, patch);
+
+    if (level >= LEVEL.trace) this.trace();
+    else if (level >= LEVEL.recolor) this.buildGeometry();
+    else if (level >= LEVEL.stretch) this.applyStretch();
+    else if (level >= LEVEL.visibility) this.applyVisibility();
+    else if (level >= LEVEL.material) this.applyMaterials();
+
+    if (level >= LEVEL.visibility) this.callbacks.onGeometry?.();
+    else if (level >= LEVEL.material) this.callbacks.onMaterials?.();
+    return this.report;
+  }
+
+  // Convenience: edit one hole (mass/position) → a metric change (re-trace).
+  updateHole(index: number, patch: Partial<Hole>): BuildResult {
+    const holes = this.state.holes.map((h, i) => (i === index ? { ...h, ...patch } : h));
+    return this.update({ holes });
+  }
+
+  // ---- readouts ------------------------------------------------------------
+
+  get holes(): readonly Hole[] { return this.state.holes; }
+  get result(): BuildResult { return this.report; }
+  get cameraTarget(): [number, number, number] { return this.target; }
+  get label(): string { return this.config.label; }
+  get camera(): LightconeSceneConfig["camera"] { return this.config.camera; }
+
+  // ---- recompute levels ----------------------------------------------------
+
+  private horizons(): Horizon[] {
+    return this.state.holes.map((h) => ({
+      x: h.x,
+      y: h.y,
+      radius: horizonRadius(h.mass, this.stopBase),
+    }));
+  }
+
+  // Re-trace the null congruence(s) from the current metric/observer, then embed.
+  private trace(): void {
+    const manifold = majumdarPapapetrou(this.state.holes);
+    const apex = Event.of(0, this.state.observer.x, this.state.observer.y);
+    const base: ConeQuality = this.state.quality === "refine" ? REFINE_CONE : COARSE_CONE;
     const tuned: ConeQuality = {
-      ...quality,
-      // The slider is the budget; worst-first spends it on the widest gaps. The
-      // deep floor lets it keep subdividing the photon-sphere shadow edge (which
-      // the old floor blocked, starving exactly the widest divergers).
-      maxRays: params.rayBudget,
+      ...base,
+      maxRays: Math.max(this.state.rayBudget, base.maxRays),
       minAngle: ANGLE_FLOOR,
     };
-    const { cone, report } = buildCone(M, apex, tuned, sceneOpts);
-    mesh = new ConeMesh(cone, {
-      embedding,
-      color: 0xf5c542,
-      colorMode,
-      // Cut the surface on the tube; keep the grid continuous so the cut is the
-      // only near-hole boundary (rays run deep inside stopRadius, then every
-      // straddling edge is backtracked to its exact intersection with the tube).
-      // Tearing here instead would shred the surface into spikes at the cut.
-      trim: { centers: holes, radius: stopRadius },
-      tear: false,
-    });
-    scene.add(mesh);
-    lastCone = cone;
+    const absorb = this.horizons().map((h) => ({ ...h, radius: h.radius * 0.45 }));
 
-    // The traced congruence, drawn out to the same tube cut as the surface, so
-    // the overlay shows exactly the rays that meshed it — dense where covered,
-    // fanned where stretched thin.
-    syncRays();
+    this.cones = [];
+    let totalRays = 0;
+    let worstGap = 0;
+    for (let s = 0; s < this.energies.length; s += 1) {
+      const { cone, report } = buildCone(manifold, apex, tuned, {
+        lambdaMax: this.state.lambdaMax,
+        terminate: absorbedWithin(absorb),
+        ...(this.energies[s] !== undefined ? { energy: this.energies[s]! } : {}),
+      });
+      this.cones.push(cone);
+      totalRays += cone.rayCount;
+      worstGap = Math.max(worstGap, report.worstGap);
+    }
+    this.report = { rays: totalRays, worstGap };
+    this.buildGeometry();
+  }
 
-    // Tube height from the visible (outside-the-cut) extent, so a deep-plunge
-    // sample can't inflate it.
+  // Rebuild every three.js object from the cached cones with the current
+  // embedding (used by re-trace and by a bare vertical-stretch change).
+  private buildGeometry(): void {
+    this.disposeGeometry();
+    const embedding = REF_EMBEDDING;
+    const horizons = this.horizons();
+    const tubeRadius = this.stopBase * 0.15;
+
+    for (let s = 0; s < this.cones.length; s += 1) {
+      const cone = this.cones[s]!;
+      const mesh = new ConeMesh(cone, {
+        embedding,
+        color: this.sheetColors[s]!,
+        colorMode: this.state.colorMode,
+        redshift: this.state.redshift,
+        trim: { centers: horizons },
+        tear: false,
+      });
+      this.group.add(mesh);
+      this.meshes.push(mesh);
+
+      const endTube = new EndTube(mesh.geometry, {
+        radius: tubeRadius,
+        cut: { centers: horizons },
+        // Rim reads a touch darker than the surface it borders — a subtle outline.
+        darken: 0.82,
+      });
+      endTube.visible = this.state.showTube;
+      this.group.add(endTube);
+      this.endTubes.push(endTube);
+    }
+
+    // Tube span from the visible (outside-the-cut) extent across every sheet.
     let tMax = 0;
-    for (let i = 0; i < cone.rayCount; i += 1) {
-      for (let j = 0; j < cone.rayLengths[i]!; j += 1) {
-        const x = cone.coord(i, j, 1);
-        const y = cone.coord(i, j, 2);
-        let outside = true;
-        for (const h of holes) {
-          if (Math.hypot(x - h.x, y - h.y) < stopRadius) {
-            outside = false;
-            break;
+    let tMin = 0;
+    for (const cone of this.cones) {
+      for (let i = 0; i < cone.rayCount; i += 1) {
+        for (let j = 0; j < cone.rayLengths[i]!; j += 1) {
+          const x = cone.coord(i, j, 1);
+          const y = cone.coord(i, j, 2);
+          let outside = true;
+          for (const h of horizons) {
+            if (Math.hypot(x - h.x, y - h.y) < h.radius) { outside = false; break; }
+          }
+          if (outside) {
+            const t = cone.coord(i, j, 0);
+            if (t > tMax) tMax = t;
+            if (t < tMin) tMin = t;
           }
         }
-        if (outside) tMax = Math.max(tMax, cone.coord(i, j, 0));
       }
     }
-    for (const h of holes) {
-      const t = worldtube(h, { embedding, tMin: 0, tMax, radius: stopRadius });
-      tubes.push(t);
-      scene.add(t);
+    // Run the horizon pillars far past the cone in both time directions, so in
+    // the print they pierce the cyclorama wall on one side and leave the frame
+    // on the other — long black rods, as in the reference. The extension is
+    // flagged `noBound` so it never inflates the camera / cyclorama framing.
+    const pad = (tMax - tMin) * 2 + 60;
+    for (let i = 0; i < this.state.holes.length; i += 1) {
+      const wt = worldtube(this.state.holes[i]!, {
+        embedding,
+        tMin: tMin - pad,
+        tMax: tMax + pad,
+        radius: horizons[i]!.radius,
+      });
+      wt.userData.noBound = true;
+      this.group.add(wt);
+      this.worldtubes.push(wt);
     }
-    target = [0, tMax * embedding.timeScale * 0.45, -3];
-    return { rays: cone.rayCount, worstGap: report.worstGap };
-  };
 
-  build();
+    this.syncRays(embedding, horizons);
+    this.centerT = (tMax + tMin) / 2;
+    this.applyStretch();
+  }
 
-  return {
-    label: "Light cone near a Majumdar–Papapetrou black hole (m = 1)",
-    camera: { position: [24, 16, 20], target },
-    params,
-    setColorMode(m) {
-      colorMode = m;
-      mesh?.setColorMode(m);
-    },
-    setShowRays(show) {
-      showRays = show;
-      syncRays();
-    },
-    rebuild(q) {
-      quality = q;
-      return build();
-    },
-    setParams(next) {
-      Object.assign(params, next);
-      // A structural change resets to coarse — refining a moved cone would block
-      // on every drag; the user re-refines when they settle.
-      quality = COARSE_CONE;
-      return build();
-    },
-  };
+  // Vertical stretch: a pure Y-scale of the baked geometry (instant — no
+  // rebuild). Recomputes the framing target for the new stretch.
+  private applyStretch(): void {
+    this.group.scale.y = this.state.timeScale;
+    this.target = [0, this.centerT * this.state.timeScale * 0.9, -3];
+  }
+
+  private syncRays(
+    embedding = REF_EMBEDDING,
+    horizons = this.horizons(),
+  ): void {
+    for (const r of this.rays) {
+      this.group.remove(r);
+      r.dispose();
+    }
+    this.rays = [];
+    if (!this.state.showRays) return;
+    for (const cone of this.cones) {
+      const r = new ConeRays(cone, { embedding, centers: horizons });
+      this.group.add(r);
+      this.rays.push(r);
+    }
+  }
+
+  private applyMaterials(): void {
+    for (const mesh of this.meshes) mesh.setColorMode(this.state.colorMode);
+  }
+
+  private applyVisibility(): void {
+    for (const t of this.endTubes) t.visible = this.state.showTube;
+    this.syncRays();
+  }
+
+  private disposeGeometry(): void {
+    for (const m of this.meshes) { this.group.remove(m); m.dispose(); }
+    for (const t of this.endTubes) { this.group.remove(t); t.dispose(); }
+    for (const r of this.rays) { this.group.remove(r); r.dispose(); }
+    for (const w of this.worldtubes) {
+      this.group.remove(w);
+      w.geometry.dispose();
+      (w.material as { dispose(): void }).dispose();
+    }
+    this.meshes = [];
+    this.endTubes = [];
+    this.rays = [];
+    this.worldtubes = [];
+  }
+
+  dispose(): void {
+    this.disposeGeometry();
+  }
 }

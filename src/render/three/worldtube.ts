@@ -23,13 +23,12 @@ export function worldtube(
   const ts = embedding.timeScale;
 
   const height = Math.max((tMax - tMin) * ts, 1e-3);
-  const geometry = new CylinderGeometry(radius, radius, height, 32, 1, false);
+  const geometry = new CylinderGeometry(radius, radius, height, 48, 1, false);
+  // The horizon reads as a dark solid pillar — near-black, faintly lit.
   const material = new MeshStandardMaterial({
-    color: options.color ?? 0x050505,
-    emissive: 0xff6a00,
-    emissiveIntensity: 0.25,
-    roughness: 0.6,
-    metalness: 0.1,
+    color: options.color ?? 0x1a1a1e,
+    roughness: 0.5,
+    metalness: 0.0,
   });
   const mesh = new Mesh(geometry, material);
   // Cylinder axis is +Y (= time in the default embedding); center it.

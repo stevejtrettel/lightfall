@@ -26,6 +26,21 @@ export function absorbedNear(
   };
 }
 
+// Like `absorbedNear`, but each center carries its own throat radius — so holes
+// of different mass absorb at different sizes.
+export function absorbedWithin(
+  centers: readonly { x: number; y: number; radius: number }[],
+): Terminator {
+  return (s) => {
+    for (const c of centers) {
+      const dx = s.pos.x - c.x;
+      const dy = s.pos.y - c.y;
+      if (dx * dx + dy * dy < c.radius * c.radius) return true;
+    }
+    return false;
+  };
+}
+
 export interface LightConeOptions {
   // Emission angles (radians), sorted. Build with a sampler from `samplers.ts`.
   directions: readonly number[];

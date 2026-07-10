@@ -12,11 +12,10 @@ export interface ConeRaysOptions {
   embedding?: SpacetimeEmbedding;
   color?: number;
   opacity?: number;
-  // Draw each ray only out to its first crossing of this radius around a centre
-  // (the tube), matching the trimmed surface. Omit to draw the full traced
-  // strand, including the plunge inside the tube.
-  clipRadius?: number;
-  centers?: readonly { x: number; y: number }[];
+  // Draw each ray only out to its first crossing of a centre's own radius (the
+  // tube), matching the trimmed surface. Omit to draw the full traced strand,
+  // including the plunge inside the tube.
+  centers?: readonly { x: number; y: number; radius: number }[];
 }
 
 // The traced congruence as line segments: one polyline per emission angle, over
@@ -29,7 +28,7 @@ export class ConeRays extends LineSegments {
 
   constructor(cone: LightCone, options: ConeRaysOptions = {}) {
     const embedding = options.embedding ?? timeUp();
-    const geometry = buildRayGeometry(cone, embedding, options.clipRadius, options.centers);
+    const geometry = buildRayGeometry(cone, embedding, options.centers);
     const mat = new LineBasicMaterial({
       color: options.color ?? 0x9fd0ff,
       transparent: true,
@@ -47,12 +46,11 @@ export class ConeRays extends LineSegments {
 }
 
 // How many valid samples of ray `i` to draw: its whole valid length, or up to
-// (and including a point on) the first crossing of `clipRadius`.
+// (and including a point on) the first crossing of a centre's own radius.
 function drawableLength(
   cone: LightCone,
   i: number,
-  clipR2: number,
-  centers: readonly { x: number; y: number }[] | undefined,
+  centers: readonly { x: number; y: number; radius: number }[] | undefined,
 ): number {
   const len = cone.rayLengths[i]!;
   if (centers === undefined) return len;
@@ -62,7 +60,7 @@ function drawableLength(
     for (const c of centers) {
       const dx = x - c.x;
       const dy = y - c.y;
-      if (dx * dx + dy * dy < clipR2) return j + 1; // include the first inside point
+      if (dx * dx + dy * dy < c.radius * c.radius) return j + 1; // include the first inside point
     }
   }
   return len;
@@ -71,22 +69,18 @@ function drawableLength(
 function buildRayGeometry(
   cone: LightCone,
   embedding: SpacetimeEmbedding,
-  clipRadius: number | undefined,
-  centers: readonly { x: number; y: number }[] | undefined,
+  centers: readonly { x: number; y: number; radius: number }[] | undefined,
 ): BufferGeometry {
-  const clip = clipRadius !== undefined ? centers : undefined;
-  const clipR2 = clipRadius !== undefined ? clipRadius * clipRadius : 0;
-
   // Two vertices per drawn segment; a ray of L drawn samples has L−1 segments.
   let segments = 0;
   for (let i = 0; i < cone.rayCount; i += 1) {
-    segments += Math.max(0, drawableLength(cone, i, clipR2, clip) - 1);
+    segments += Math.max(0, drawableLength(cone, i, centers) - 1);
   }
   const positions = new Float32Array(segments * 2 * 3);
 
   let o = 0;
   for (let i = 0; i < cone.rayCount; i += 1) {
-    const len = drawableLength(cone, i, clipR2, clip);
+    const len = drawableLength(cone, i, centers);
     for (let j = 0; j < len - 1; j += 1) {
       embedding.embedInto(positions, o, cone.coord(i, j, 0), cone.coord(i, j, 1), cone.coord(i, j, 2));
       o += 3;

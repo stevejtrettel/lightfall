@@ -16,7 +16,6 @@ function build(overrides: Record<string, number> = {}) {
     maxRadius: 13,
     terminate: absorbedNear(holes, 0.3),
     initialRays: 24,
-    sagTol: 0.06,
     edgeTol: 0.25,
     maxRays: 5000,
     ...overrides,
@@ -85,33 +84,10 @@ test("rays concentrate toward the lensing hole, not away from it", () => {
   );
 });
 
-test("tightening sagTol resolves the lens WITHOUT flooding the empty sky", () => {
-  // The core fix, and the whole point of going absolute. The sag tolerance is
-  // absolute, not normalized per-gap, so sharpening the lensed core leaves the
-  // calm far field untouched. The OLD relative criterion could not: it read the
-  // sky's trivial circular spreading as just as "curved" as a real lens and
-  // refined it in lockstep, flooding the empty sky when you tightened for the
-  // hole. Edge off (huge) so sagTol is the sole driver; the hole must densify
-  // sharply while the sky barely moves.
-  const loose = build({ edgeTol: 1e9, sagTol: 0.3 });
-  const tight = build({ edgeTol: 1e9, sagTol: 0.02, maxRays: 20000 });
-
-  const skyLoose = countNear(loose.cone.directions, (3 * Math.PI) / 2, 0.6);
-  const skyTight = countNear(tight.cone.directions, (3 * Math.PI) / 2, 0.6);
-  const holeLoose = countNear(loose.cone.directions, Math.PI / 2, 0.6);
-  const holeTight = countNear(tight.cone.directions, Math.PI / 2, 0.6);
-
-  assert.ok(holeTight > holeLoose * 2, `tighter sagTol densifies the lens (${holeLoose} → ${holeTight})`);
-  assert.ok(
-    skyTight <= skyLoose + 4,
-    `the empty sky is NOT flooded (loose ${skyLoose}, tight ${skyTight})`,
-  );
-});
-
 test("edgeTol drives the even-sampling density everywhere, including the sky", () => {
-  // Unlike sagTol, the size test refines the whole surface toward a uniform edge
-  // length — so a smaller edgeTol adds rays across the board, the calm sky
-  // included. That is the desired *even* sampling, not the pathological flooding.
+  // The size test refines the whole surface toward a uniform edge length — so a
+  // smaller edgeTol adds rays across the board, the calm sky included. That is the
+  // desired *even* sampling, not pathological flooding.
   const coarse = build({ edgeTol: 0.5 });
   const fine = build({ edgeTol: 0.15, maxRays: 20000 });
   assert.ok(fine.cone.rayCount > coarse.cone.rayCount * 1.5, "a smaller edgeTol adds rays");
@@ -126,7 +102,7 @@ test("budget-driven worst-first: more rays close the widest gaps first", () => {
   // the demo's "ray budget" slider relies on exactly this. (A deep floor is
   // required: at the default 2π/2048 the photon-sphere edge is floor-limited and
   // no budget can move it.)
-  const opts = { edgeTol: 0.02, sagTol: 0.02, minAngle: (2 * Math.PI) / 1048576 };
+  const opts = { edgeTol: 0.02, minAngle: (2 * Math.PI) / 1048576 };
   const lean = build({ ...opts, maxRays: 250 });
   const rich = build({ ...opts, maxRays: 2000 });
   assert.ok(rich.cone.rayCount > lean.cone.rayCount, "the larger budget is actually spent");
@@ -142,22 +118,20 @@ test("huge tolerances refine nothing — parity with the seed ring (flat space)"
     samples: 140,
     step: 0.08,
     initialRays: 24,
-    sagTol: 1e9,
     edgeTol: 1e9,
   });
-  assert.equal(cone.rayCount, 24, "no refinement when tolerances are enormous");
+  assert.equal(cone.rayCount, 24, "no refinement when the tolerance is enormous");
 });
 
 test("flat space refines EVENLY — the trivial circle is not lopsided", () => {
   // With no lens, the edge test alone drives sampling: the circle is refined to a
   // roughly uniform density, not concentrated anywhere. (Contrast the hole case,
-  // where the sag/fate tests pull rays toward the lens.)
+  // where the strongly-separating lensed rays and the fate test pull rays in.)
   const { cone } = adaptiveLightCone(minkowski(), Event.of(0, 0, 0), {
     samples: 140,
     step: 0.08,
     initialRays: 24,
-    sagTol: 1e9, // curvature off — pure size-driven, so it MUST be uniform
-    edgeTol: 0.4,
+    edgeTol: 0.4, // pure size-driven ⇒ MUST be uniform with no lens
   });
   const q0 = countNear(cone.directions, 0, Math.PI / 4);
   const q1 = countNear(cone.directions, Math.PI / 2, Math.PI / 4);

@@ -6,3 +6,6 @@ export * from "./embedding.ts";
 export * from "./cone-mesh.ts";
 export * from "./cone-rays.ts";
 export * from "./worldtube.ts";
+export * from "./end-tube.ts";
+export * from "./redshift.ts";
+export * from "./obj-export.ts";
