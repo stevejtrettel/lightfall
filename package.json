@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Interactive visualization of the light cones of black-hole spacetimes.",
   "scripts": {
+    "build:all": "node scripts/build-all.mjs",
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --test test/*.test.ts",
     "test:coverage": "node --test --experimental-test-coverage test/*.test.ts",
